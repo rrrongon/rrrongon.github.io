@@ -1,16 +1,115 @@
 ---
+const experimentModules = import.meta.glob('./experiments/*.mdx', { eager: true });
+const experiments = Object.values(experimentModules)
+  .map((mod: any) => ({
+    url: mod.url,
+    ...mod.frontmatter,
+  }))
+  .sort((a, b) => (a.order ?? 99) - (b.order ?? 99));
 ---
-
+<!doctype html>
 <html lang="en">
-	<head>
-		<meta charset="utf-8" />
-		<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-		<link rel="icon" href="/favicon.ico" />
-		<meta name="viewport" content="width=device-width" />
-		<meta name="generator" content={Astro.generator} />
-		<title>Astro</title>
-	</head>
-	<body>
-		<h1>Astro</h1>
-	</body>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Rubayet Rahman Rongon — Systems & ML Infrastructure Portfolio</title>
+    <style>
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        line-height: 1.6;
+        color: #0f172a;
+        max-width: 860px;
+        margin: 0 auto;
+        padding: 3rem 1.5rem 5rem;
+      }
+      header {
+        border-bottom: 1px solid #e2e8f0;
+        padding-bottom: 1.75rem;
+        margin-bottom: 2.5rem;
+      }
+      h1 {
+        font-size: 2.1rem;
+        margin: 0 0 0.5rem;
+      }
+      .bio {
+        color: #475569;
+        font-size: 1.05rem;
+        margin: 0 0 1rem;
+      }
+      .links a {
+        color: #2563eb;
+        text-decoration: none;
+        margin-right: 1.25rem;
+        font-weight: 500;
+        font-size: 0.95rem;
+      }
+      h2 {
+        font-size: 1.35rem;
+        margin-bottom: 1.25rem;
+      }
+      .card {
+        display: block;
+        border: 1px solid #e2e8f0;
+        border-radius: 8px;
+        padding: 1.25rem 1.5rem;
+        margin-bottom: 1rem;
+        text-decoration: none;
+        color: inherit;
+        transition: border-color 0.15s ease, background 0.15s ease;
+      }
+      .card:hover {
+        border-color: #2563eb;
+        background: #f8fafc;
+      }
+      .card-title {
+        font-size: 1.15rem;
+        font-weight: 700;
+        color: #0f172a;
+        margin: 0 0 0.35rem;
+      }
+      .card-summary {
+        color: #475569;
+        font-size: 0.95rem;
+        margin: 0 0 0.85rem;
+      }
+      .tags {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.45rem;
+      }
+      .tag {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 0.78rem;
+        background: #f1f5f9;
+        color: #334155;
+        padding: 0.15rem 0.5rem;
+        border-radius: 4px;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Rubayet Rahman Rongon</h1>
+      <p class="bio">
+        Systems &amp; ML Infrastructure Engineer — LLM inference serving, KV-cache management, hybrid vector retrieval, and high-throughput data pipelines.
+      </p>
+      <div class="links">
+        <a href="https://github.com/rrrongon">GitHub</a>
+        <a href="https://orcid.org/0009-0001-7827-7697">ORCID</a>
+      </div>
+    </header>
+
+    <main>
+      <h2>Experimental Benchmarks &amp; Architecture Deep Dives</h2>
+      {experiments.map((exp) => (
+        <a class="card" href={exp.url}>
+          <div class="card-title">{exp.title}</div>
+          <p class="card-summary">{exp.summary}</p>
+          <div class="tags">
+            {exp.tags?.map((tag: string) => <span class="tag">{tag}</span>)}
+          </div>
+        </a>
+      ))}
+    </main>
+  </body>
 </html>
