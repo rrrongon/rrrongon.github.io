@@ -135,7 +135,234 @@ $$\text{MRR@3} = \frac{1}{N} \sum_{i=1}^{N} \text{RR}_i, \quad \text{where } \te
     {"id": "q14", "category": "exact_id", "query": "limit sequence KV-cache using --max-model-len", "expected_doc_id": "doc_20"}
   ]
 }
-```
 
+```
 </details>
 
+---
+
+## 4. Retrieval Methodology & Asymmetric Search
+
+To understand where lexical and neural search succeed or fail on our v2.0 benchmark, we evaluate three retrieval strategies served via **vLLM** (`intfloat/e5-small`, `runner="pooling"`).
+
+### 4.1 Dense Semantic Retrieval (vLLM Pooling)
+- **How it works:** Dense retrieval maps text into a continuous vector space to capture conceptual meaning rather than exact word overlap:
+  1. **Tokenization & Single Forward Pass:** Input text is split into subword tokens and passed through `intfloat/e5-small` (a 12-layer bidirectional transformer encoder combining self-attention and feed-forward layers). With `runner="pooling"`, vLLM skips autoregressive token decoding and runs a single prefill forward pass.
+  2. **Mean Pooling:** Token-level hidden states are averaged into a single **384-dimensional** dense vector representing the entire chunk.
+  3. **L2 Normalization & Dot Product:** Vectors are normalized to unit length ($\|\mathbf{v}\|_2 = 1$). Because unit vectors have magnitude `1`, cosine similarity simplifies to a fast matrix dot product:
+
+$$
+\text{sim}(\mathbf{q}, \mathbf{d}) = \mathbf{q} \cdot \mathbf{d}
+$$
+
+- **Strength & Limitation:** Understands synonyms and paraphrased ideas easily, but often confuses near-duplicate documents that differ only by an exact number or error code.
+
+### 4.2 Sparse Lexical Retrieval (BM25)
+- **How it works:** To overcome the tendency of dense embeddings to blur rare tokens and exact identifiers, we use **Best Matching 25 (BM25)**. BM25 is a statistical, exact-match sparse retrieval algorithm—not a neural embedding model. It scores documents by matching exact tokens (preserving underscores and hyphens via regex `r"[a-z0-9_-]+"` so identifiers like `err_4094` and `--max-model-len` remain intact).
+- **Scoring mechanics:** It rewards rare, high-signal terms via **Inverse Document Frequency (IDF)**, caps repeated words using **Term Frequency (TF) saturation**, and normalizes for document length.
+- **Strength & Limitation:** Unbeatable for exact alphanumeric identifiers (`ERR_4094`, `SKU-901B`), but fails completely (`0.0` score) on paraphrased queries that share zero keywords with the target document.
+
+
+---
+
+## 5. Baseline Ablation Analysis: Dense vs. BM25
+
+| Experiment | Recall@3 | MRR@3 | Semantic MRR | Exact-ID MRR |
+| :--- | :---: | :---: | :---: | :---: |
+| **Dense (no prefixes)** | 0.79 | 0.62 | 0.88 | 0.52 |
+| **BM25 only** | 0.93 | 0.86 | 0.50 | 1.00 |
+
+### 5.1 Dense Retrieval (No Prefixes)
+- **What it is:** Neural semantic search using `intfloat/e5-small` via **vLLM** (`runner="pooling"`). Raw query and document strings are converted into 384-dimensional L2-normalized vectors without `"query: "` or `"passage: "` task prefixes, and ranked by dot-product similarity.
+- **What the numbers show:**
+  - **Overall coverage & rank:** Dense found the expected document in the top 3 **79%** of the time (`11 / 14` queries), with an `MRR@3` of **0.62**.
+  - **Strong conceptual matching (`Semantic MRR = 0.88`):** On paraphrased queries (`q01`–`q04`), Dense ranked 3 out of 4 targets at #1 and 1 target at #2 (`(1.0 + 1.0 + 1.0 + 0.5) / 4 = 0.88`), bridging synonyms like *VRAM* and *memory* without needing exact keyword overlap.
+  - **Exact-identifier collapse (`Exact-ID MRR = 0.52`):** On strict code lookups (`q05`–`q14`), performance dropped sharply because subword tokenization blurs arbitrary numbers (`ERR_4091`–`ERR_4096`, `SKU-901A`–`901D`) inside near-identical sentence templates.
+
+### 5.2 BM25 Only (Sparse Lexical Retrieval)
+- **What it is:** A statistical, exact-match keyword ranking algorithm (`BM25Okapi`) that scores documents based on shared tokens (preserving underscores and hyphens via regex `r"[a-z0-9_-]+"`), boosting rare terms via IDF and capping repeated words via TF saturation.
+- **What the numbers show:**
+  - **Overall coverage & rank:** BM25 found the expected document in the top 3 **93%** of the time (`13 / 14` queries), with an `MRR@3` of **0.86**.
+  - **Perfect identifier precision (`Exact-ID MRR = 1.00`):** Every single exact-ID query (`10 / 10`) landed at Rank #1 because unique tokens like `err_4094` and `sku-901b` carry high IDF weight while shared boilerplate words are discounted.
+  - **Semantic blind spot (`Semantic MRR = 0.50`):** On conceptual queries (`q01`–`q04`), BM25 dropped to **0.50** (missing top-3 completely on 1 zero-keyword-overlap query and ranking 2 others at #2), because it has no understanding of synonyms or paraphrased intent.
+
+### 5.3 Two Key Takeaways Beyond the Headline Numbers
+
+1. **Aggregate Metrics Can Be Misleading (Dataset Slice Skew):** Looking only at overall `Recall@3` (`0.93` vs. `0.79`) makes BM25 appear strictly superior to Dense. However, 10 of the 14 queries (71%) in `v2.0` are `exact_id` lookups. Slicing metrics by query category exposes BM25's `0.50` failure on semantic queries that aggregate averages would otherwise hide.
+2. **The Recall–MRR Gap Reveals "Cluster Confusion" in Dense Search:** For Dense (no prefixes), `Recall@3` is `0.79` while `MRR@3` drops to `0.62` (a `0.17` gap). This shows that Dense usually retrieves the right topic cluster into the top 3 (e.g., returning `ERR_4091`, `ERR_4092`, and `ERR_4094` together), but lacks the token-level sharpness to place the exact target at Rank #1.
+
+
+### 5.4 Asymmetric Prefixes: Closing the Semantic Gap
+
+In our baseline experiment, **Dense (no prefixes)** achieved a `Semantic MRR` of **0.88**—meaning 3 out of 4 conceptual queries landed at Rank #1, while 1 landed at Rank #2. Before addressing exact-ID collisions, our first hypothesis was to test whether we could push conceptual retrieval to **1.00** by fixing how the model encodes questions versus documents.
+
+When we pass raw text into `intfloat/e5-small`, the encoder treats a short, open-ended user question (*"How do I stop my yearly membership from auto-renewing?"*) and a longer declarative document (*"To cancel a recurring annual plan..."*) as the exact same type of text. However, `e5-small` was trained with explicit task prefixes—`"query: "` for search inputs and `"passage: "` for indexed documents—to bridge this structural asymmetry in vector space. By supplying those prefixes, we hypothesized the model would align questions with their answers more tightly and eliminate the remaining semantic ranking error.
+
+| Experiment | Recall@3 | MRR@3 | Semantic MRR | Exact-ID MRR |
+| :--- | :---: | :---: | :---: | :---: |
+| **Dense (no prefixes)** | 0.79 | 0.62 | 0.88 | 0.52 |
+| **Dense (with prefixes)** | 0.71 | 0.63 | 1.00 | 0.48 |
+
+**What the numbers show:**
+- **Hypothesis confirmed on semantic queries (`Semantic MRR`: `0.88` $\rightarrow$ `1.00`):** Adding `"query: "` and `"passage: "` prefixes resolved the remaining rank-#2 miss, placing 100% of paraphrased queries at Rank #1.
+- **Unintended regression on exact identifiers (`Recall@3`: `0.79` $\rightarrow$ `0.71`, `Exact-ID MRR`: `0.52` $\rightarrow$ `0.48`):** While semantic ranking perfected, every other metric dropped—meaning more expected document IDs missed the top 3 or fell to lower ranks.
+- **Why this happens:** Prefixes push the encoder to prioritize high-level sentence intent over surface-level token details. Because our `ERR_4091`–`ERR_4096` and `EXIT_137`–`EXIT_255` documents share nearly identical sentence templates, stronger semantic abstraction pulls their embeddings even closer together, causing the wrong error code to outrank the true target.
+
+This result confirmed that no single dense configuration can maximize both slices at once—motivating our move to **Hybrid Search (Dense + BM25)** in the next experiment.
+
+
+### 5.5 The Idea Behind Hybrid Search & Reciprocal Rank Fusion (RRF)
+
+Neither retriever alone is reliable enough for production:
+- **Dense (with prefixes)** achieves **1.00** on semantic understanding, but drops to **0.48** on exact IDs.
+- **BM25 only** achieves **1.00** on exact IDs, but drops to **0.50** on semantic queries.
+
+**The Hybrid Goal:** Combine both systems so we get BM25's exact-token precision for error codes and CLI flags alongside Dense's conceptual understanding for paraphrased questions.
+
+**How Reciprocal Rank Fusion (RRF) Works:**
+Dense search outputs cosine similarity scores between `0` and `1`, whereas BM25 outputs unbounded keyword scores (e.g., `0` to `15+`). Because these raw scores live on completely different scales, adding them directly would let whichever system has larger numbers dominate. RRF solves this by ignoring raw scores and combining rank positions instead—giving a high boost to documents ranked near the top (`#1`, `#2`, `#3`) and smoothly tapering off credit for lower-ranked documents:
+
+$$
+\text{RRF}(d) = \sum_{r \in \{\text{Dense}, \text{BM25}\}} \frac{w_r}{k + \text{rank}_r(d)}
+$$
+
+
+### 5.6 Naive 50–50 Hybrid Results & Real-World Improvements
+
+| Experiment | Recall@3 | MRR@3 | Semantic MRR | Exact-ID MRR |
+| :--- | :---: | :---: | :---: | :---: |
+| **Hybrid (Dense + BM25 RRF)** | 0.93 | 0.69 | 0.75 | 0.67 |
+
+**What the numbers show:**
+- **High retrieval coverage (`Recall@3 = 0.93`):** Hybrid recovered the expected document in the top 3 for `13 / 14` queries, matching BM25's best coverage and beating Dense (`0.71`) by **+22 percentage points**.
+- **Rank dilution (`MRR@3 = 0.69`, `Semantic MRR = 0.75`, `Exact-ID MRR = 0.67`):** Even though the right document is almost always inside the top 3, equal 50–50 RRF drags its rank down from `#1` to `#2` or `#3`:
+  - On zero-keyword semantic queries, BM25 finds no matching words and ranks the true document near the bottom—pulling Dense's `#1` pick down (`1.00` $\rightarrow$ `0.75`).
+  - On exact-ID queries, Dense confuses similar error templates and ranks the true document low—pulling BM25's `#1` pick down (`1.00` $\rightarrow$ `0.67`).
+
+**How to Improve Hybrid Search in Real-Life Production:**
+1. **Filter Zero-Match BM25 Noise:** Never let BM25 contribute a rank penalty or tie-breaker when a document has zero keyword overlap (`BM25 score == 0`), preventing irrelevant lexical misses from outvoting top semantic hits.
+2. **Tune Fusion Weights to Workload Requirements:** Instead of a hardcoded 50–50 split, weight the two retrievers based on your application's query mix (for example, `0.7` Dense / `0.3` BM25 for conceptual knowledge bases, or boosting lexical weight when regex detects error codes, SKUs, or CLI flags).
+3. **Add a Two-Stage Cross-Encoder Reranker:** Because `Recall@3` is already `0.93`, the candidate set is strong. Passing the top 5–10 hybrid candidates through a cross-encoder reranker (via vLLM's `llm.score()`) evaluates the query and document tokens together, pushing `#2` and `#3` hits up to `#1` and closing the gap between `Recall@3` (`0.93`) and `MRR@3` (`0.69`).
+
+### 5.7 Complete Ablation Summary
+
+| Experiment | Recall@3 | MRR@3 | Semantic MRR | Exact-ID MRR | Key Takeaway |
+| :--- | :---: | :---: | :---: | :---: | :--- |
+| **Dense (no prefixes)** | 0.79 | 0.62 | 0.88 | 0.52 | Misaligned query/passage space; blurs numeric codes. |
+| **Dense (with prefixes)** | 0.71 | 0.63 | 1.00 | 0.48 | Solves 100% of paraphrases, but worsens exact-ID collisions. |
+| **BM25 only** | 0.93 | 0.86 | 0.50 | 1.00 | Perfect on exact identifiers; fails when zero words overlap. |
+| **Hybrid (50–50 RRF)** | 0.93 | 0.69 | 0.75 | 0.67 | Matches peak `Recall@3` (`0.93`); exposes rank dilution fixed by zero-score filtering, tuned weights, and reranking. |
+
+
+
+
+---
+
+---
+
+## 6. Indexing Throughput: Single Prompt vs. Batching
+
+To measure offline corpus-indexing efficiency on **2,048 documents** (`intfloat/e5-small`, `runner="pooling"`), we benchmarked sequential single-prompt requests (`batch_size = 1`) against batched prefill execution (`batch_size = 4` to `2048`).
+
+> **Benchmark Workload Note:** All 2,048 benchmark inputs used a uniform ~13-token synthetic template (`f"passage: Incident report #{i}: Postgres connection pool exhausted."`), representing ~15.8k tokens/s at peak (`batch_size = 1024`). Because `intfloat/e5-small` is a bidirectional encoder (`runner="pooling"`), vLLM executes full self-attention without KV-cache prefix reuse; on longer production chunks (`256–512` tokens), GPU saturation occurs earlier (`batch_size = 64–256`) at proportionally lower `docs/s`.
+
+<svg viewBox="0 0 760 330" width="100%" role="img" aria-label="vLLM Embedding Throughput Benchmark across batch sizes 1 to 2048">
+  <rect x="0" y="0" width="760" height="330" rx="8" fill="#f8fafc" stroke="#e2e8f0" />
+  <text x="380" y="26" text-anchor="middle" font-size="14" font-weight="700" fill="#0f172a">vLLM Pooling Throughput vs. Batch Size (2,048 Docs)</text>
+
+  {/* Horizontal grid lines & Y-axis labels (0 to 1400 docs/s) */}
+  <line x1="75" y1="265" x2="715" y2="265" stroke="#cbd5e1" stroke-width="1" />
+  <text x="65" y="269" text-anchor="end" font-size="11" fill="#475569">0</text>
+
+  <line x1="75" y1="210" x2="715" y2="210" stroke="#e2e8f0" stroke-dasharray="4 4" />
+  <text x="65" y="214" text-anchor="end" font-size="11" fill="#475569">350</text>
+
+  <line x1="75" y1="155" x2="715" y2="155" stroke="#e2e8f0" stroke-dasharray="4 4" />
+  <text x="65" y="159" text-anchor="end" font-size="11" fill="#475569">700</text>
+
+  <line x1="75" y1="100" x2="715" y2="100" stroke="#e2e8f0" stroke-dasharray="4 4" />
+  <text x="65" y="104" text-anchor="end" font-size="11" fill="#475569">1,050</text>
+
+  <line x1="75" y1="45" x2="715" y2="45" stroke="#e2e8f0" stroke-dasharray="4 4" />
+  <text x="65" y="49" text-anchor="end" font-size="11" fill="#475569">1,400</text>
+
+  <text x="20" y="155" text-anchor="middle" font-size="11" font-weight="600" fill="#475569" transform="rotate(-90 20 155)">Throughput (docs/s)</text>
+
+  {/* Bars: x = 90 + i * 62, width = 38 */}
+  {/* BS=1: 58.0 */}
+  <rect x="90" y="256" width="38" height="9" rx="3" fill="#94a3b8" />
+  <text x="109" y="250" text-anchor="middle" font-size="10" font-weight="600" fill="#334155">58</text>
+  <text x="109" y="283" text-anchor="middle" font-size="11" fill="#0f172a">1</text>
+
+  {/* BS=4: 144.4 */}
+  <rect x="152" y="242" width="38" height="23" rx="3" fill="#3b82f6" />
+  <text x="171" y="236" text-anchor="middle" font-size="10" font-weight="600" fill="#334155">144</text>
+  <text x="171" y="283" text-anchor="middle" font-size="11" fill="#0f172a">4</text>
+
+  {/* BS=8: 217.6 */}
+  <rect x="214" y="231" width="38" height="34" rx="3" fill="#3b82f6" />
+  <text x="233" y="225" text-anchor="middle" font-size="10" font-weight="600" fill="#334155">218</text>
+  <text x="233" y="283" text-anchor="middle" font-size="11" fill="#0f172a">8</text>
+
+  {/* BS=32: 466.2 */}
+  <rect x="276" y="192" width="38" height="73" rx="3" fill="#3b82f6" />
+  <text x="295" y="186" text-anchor="middle" font-size="10" font-weight="600" fill="#334155">466</text>
+  <text x="295" y="283" text-anchor="middle" font-size="11" fill="#0f172a">32</text>
+
+  {/* BS=64: 537.8 */}
+  <rect x="338" y="180" width="38" height="85" rx="3" fill="#3b82f6" />
+  <text x="357" y="174" text-anchor="middle" font-size="10" font-weight="600" fill="#334155">538</text>
+  <text x="357" y="283" text-anchor="middle" font-size="11" fill="#0f172a">64</text>
+
+  {/* BS=128: 749.8 */}
+  <rect x="400" y="147" width="38" height="118" rx="3" fill="#2563eb" />
+  <text x="419" y="141" text-anchor="middle" font-size="10" font-weight="600" fill="#334155">750</text>
+  <text x="419" y="283" text-anchor="middle" font-size="11" fill="#0f172a">128</text>
+
+  {/* BS=256: 1065.7 */}
+  <rect x="462" y="98" width="38" height="167" rx="3" fill="#2563eb" />
+  <text x="481" y="92" text-anchor="middle" font-size="10" font-weight="600" fill="#334155">1,066</text>
+  <text x="481" y="283" text-anchor="middle" font-size="11" fill="#0f172a">256</text>
+
+  {/* BS=512: 1003.8 */}
+  <rect x="524" y="107" width="38" height="158" rx="3" fill="#2563eb" />
+  <text x="543" y="101" text-anchor="middle" font-size="10" font-weight="600" fill="#334155">1,004</text>
+  <text x="543" y="283" text-anchor="middle" font-size="11" fill="#0f172a">512</text>
+
+  {/* BS=1024: 1218.7 (Peak) */}
+  <rect x="586" y="73" width="38" height="192" rx="3" fill="#059669" />
+  <text x="605" y="67" text-anchor="middle" font-size="10" font-weight="700" fill="#059669">1,219 (21x)</text>
+  <text x="605" y="283" text-anchor="middle" font-size="11" font-weight="700" fill="#059669">1024</text>
+
+  {/* BS=2048: 1130.0 */}
+  <rect x="648" y="87" width="38" height="178" rx="3" fill="#2563eb" />
+  <text x="667" y="81" text-anchor="middle" font-size="10" font-weight="600" fill="#334155">1,130</text>
+  <text x="667" y="283" text-anchor="middle" font-size="11" fill="#0f172a">2048</text>
+
+  <text x="395" y="312" text-anchor="middle" font-size="11" font-weight="600" fill="#475569">Batch Size (documents per call)</text>
+</svg>
+
+| Batch Size | Total Time (s) | Throughput (docs/s) | Speedup | Regime |
+| :---: | :---: | :---: | :---: | :--- |
+| **1** | 35.29 | 58.0 | 1.0x | Python/scheduler overhead bound |
+| **4** | 14.18 | 144.4 | 2.5x | Overhead amortization begins |
+| **8** | 9.41 | 217.6 | 3.7x | Overhead amortization |
+| **32** | 4.39 | 466.2 | 8.0x | Near-linear GPU scaling |
+| **64** | 3.81 | 537.8 | 9.3x | Near-linear GPU scaling |
+| **128** | 2.73 | 749.8 | 12.9x | High Tensor Core utilization |
+| **256** | 1.92 | 1,065.7 | 18.4x | Saturation knee (`< 2s` total) |
+| **512** | 2.04 | 1,003.8 | 17.3x | Saturated plateau |
+| **1024** | **1.68** | **1,218.7** | **21.0x** | **Peak throughput** |
+| **2048** | 1.81 | 1,130.0 | 19.5x | Token-budget chunking ceiling |
+
+### What the Results Show
+
+1. **Single-Prompt Overhead Bottleneck (`BS = 1` $\rightarrow$ `58.0 docs/s`):** Processing 2,048 documents one at a time takes **35.29s**. Because `intfloat/e5-small` is a lightweight 33M-parameter encoder, the GPU finishes each forward pass in sub-milliseconds while most wall-clock time is wasted in Python tokenization, vLLM scheduler dispatch, and CUDA kernel-launch overhead.
+2. **Amortization & GPU Saturation (`BS = 32` to `1024` $\rightarrow$ `21.0x` Speedup):** Batching amortizes fixed per-call overhead and saturates GPU Tensor Cores via dense matrix-matrix (`GEMM`) operations. Throughput climbs from `58.0` to **1,218.7 docs/s** at `batch_size = 1024`, cutting total indexing time from **35.29s** down to **1.68s**.
+3. **Diminishing Returns Beyond the Knee (`BS ≥ 256`):** Most gains are already captured by `batch_size = 256` (`1,065.7 docs/s`, `18.4x`). Pushing to `2048` (`1,130.0 docs/s`) yields no further speedup because vLLM's `--max-num-batched-tokens` scheduler internally splits oversized batches into bounded prefill chunks.
+
+**Production Takeaway:** Use `batch_size = 1` only for real-time interactive user queries (where single-request latency matters), and batch offline document ingestion at **`256–1024` docs per call** for a **~20x throughput gain**.
+
+
+
+```
