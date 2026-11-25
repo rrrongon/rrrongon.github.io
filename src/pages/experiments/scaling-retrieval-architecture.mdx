@@ -1,0 +1,120 @@
+---
+layout: ../../layouts/ExperimentLayout.astro
+title: "Scaling Retrieval to Large Document Collections: Data Management & Infrastructure Architecture"
+summary: "Re-architecting a retrieval prototype around PostgreSQL 17 + pgvector, parent-child chunking, and SHA-256 incremental ingestion, benchmarked on BeIR/scifact."
+date: "2026-11-25"
+order: 2
+tags: ["PostgreSQL 17", "pgvector", "HNSW", "vLLM", "BeIR/scifact", "Docker", "Hybrid Search"]
+highlights:
+  - label: "Corpus Scale"
+    value: "5,183 Docs (BeIR/scifact)"
+  - label: "Storage & Index"
+    value: "Postgres 17 (HNSW + GIN)"
+  - label: "Chunking"
+    value: "120-Word Parent-Child"
+  - label: "Ingestion"
+    value: "SHA-256 Incremental (BS=256)"
+---
+
+Transitioning a retrieval prototype from a small, single-sentence benchmark (22 in-memory passages) to thousands of multi-paragraph documents exposes three immediate bottlenecks:
+
+1. **Ephemeral, linear storage ($O(N)$):** In-memory NumPy arrays and Python keyword indices disappear on restart, lack transactional updates, and require scanning every vector on every query.
+2. **Context truncation and topic dilution:** `intfloat/e5-small` enforces a strict 512-token limit. Feeding long documents unchunked truncates trailing sections, while compressing multiple topics into one 384-dimensional vector dilutes retrieval precision.
+3. **Redundant GPU compute:** Re-embedding an entire corpus whenever a subset of documents changes wastes **vLLM** prefill throughput.
+
+To resolve these bottlenecks, the data layer was re-architected around a Dockerized **PostgreSQL + pgvector** backend, **Parent-Child chunking**, and **SHA-256 incremental batch ingestion** benchmarked on a real-world multi-paragraph dataset.
+
+---
+
+## 1. Benchmark Dataset: Scaling from Synthetic Sentences to `BeIR/scifact`
+
+To test long-document ingestion and index scaling without losing deterministic `Recall@3` and `MRR@3` regression tracking, the pipeline was scaled to **`BeIR/scifact`**, a standard public information-retrieval benchmark containing real multi-paragraph scientific abstracts paired with human-labeled query relevance judgments (`qrels`):
+
+| Dataset Artifact | Scale & Structure | Role in the Pipeline |
+| :--- | :--- | :--- |
+| **Document Corpus (`corpus`)** | 5,183 multi-paragraph documents (`title` + `abstract`) | Replaces the 22 single-sentence prototype passages with longer, multi-claim texts requiring chunking and disk-backed indexing. |
+| **Test Queries (`queries`)** | 300 labeled evaluation queries | Sliced into conceptual paraphrases and exact-number/identifier lookups to maintain consistent regression diagnostics. |
+| **Relevance Labels (`qrels`)** | Ground-truth `query-id` $\rightarrow$ `corpus-id` mappings | Serves as the automated answer key for `Recall@3` and `MRR@3` verification after database migration. |
+
+### Local Staging & Data Profiling
+
+- **Immutable local snapshots:** Raw Hugging Face splits are pulled once and serialized locally (`data/scifact_raw.json`), decoupling network I/O from GPU embedding runs.
+- **Length profiling:** Document word counts were profiled prior to chunking to ensure child windows remain safely below `e5-small`'s 512-token ceiling without truncating critical findings.
+
+---
+
+## 2. Environment & Infrastructure Setup (Docker + PostgreSQL + pgvector)
+
+Rather than maintaining separate vector and keyword databases—which introduces dual-write synchronization bugs when documents change—both dense embeddings and lexical full-text tokens are unified inside a single **PostgreSQL 17** instance running the `pgvector` extension.
+
+```text
+┌──────────────────────┐      Batched Prefill (bs=256)      ┌──────────────────────────────┐
+│  Parent-Child Chunks │ ─────────────────────────────────► │   vLLM (intfloat/e5-small)   │
+│  + SHA-256 Diffing   │                                    │   runner="pooling" (384-d)   │
+└──────────┬───────────┘                                    └──────────────┬───────────────┘
+           │                                                               │
+           │  Text, Parent Metadata & Hashes             L2-Normalized Vectors
+           ▼                                                               ▼
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│                        Docker Container: pgvector/pgvector:pg17                          │
+│                                                                                          │
+│   Table: scifact_chunks                                                                  │
+│   ├── chunk_id (PK) | parent_id | child_text | parent_text | content_hash                │
+│   ├── embedding vector(384)  ──► HNSW Index (vector_ip_ops)   [O(log N) Semantic Search] │
+│   └── fts tsvector ('simple') ──► GIN Index                   [Exact-Token Search]       │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Container & Driver Configuration
+
+- **Container runtime (`docker-compose.yml`):** Runs the official `pgvector/pgvector:pg17` image with a persistent named volume (`pgdata:/var/lib/postgresql/data`) mapped to port `5432`, so vectors and indexes survive container restarts.
+- **Python database client:** Uses `psycopg` (v3) with `pgvector.psycopg.register_vector()` so NumPy `float32` arrays map natively to PostgreSQL `vector(384)` columns without manual string serialization.
+
+### Unified Table Schema
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE IF NOT EXISTS scifact_chunks (
+    chunk_id     TEXT PRIMARY KEY,
+    parent_id    TEXT NOT NULL,
+    child_text   TEXT NOT NULL,
+    parent_text  TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    embedding    vector(384) NOT NULL,
+    fts          tsvector GENERATED ALWAYS AS (to_tsvector('simple', child_text)) STORED
+);
+```
+
+Three schema decisions govern data integrity and search precision:
+
+1. **`GENERATED ALWAYS AS (to_tsvector('simple', child_text)) STORED`:** Automatically synchronizes lexical tokens on every `INSERT` or `UPDATE`. Using the `'simple'` dictionary instead of `'english'` prevents aggressive stemming from mangling technical codes, acronyms, or hyphenated flags.
+2. **`vector(384)`:** Matches `intfloat/e5-small`'s hidden dimension size directly.
+3. **`parent_id` + `parent_text` co-location:** Stores the full parent document alongside each child row so retrieval can deduplicate at the parent level in a single SQL query without secondary joins.
+
+---
+
+## 3. Data Management & Scaling Pipeline
+
+### Step A: Parent-Child Chunking with Contextual Breadcrumbs
+
+Splitting a long document into isolated fragments strips away its title and topic context, causing trailing chunks (e.g., *"Results showed a 40% reduction..."*) to lose semantic identity.
+
+- **Sliding-window decomposition:** Each parent document is split into overlapping 120-word child windows (`overlap = 20` words) to preserve cross-boundary sentences while staying well inside the 512-token encoder limit.
+- **Contextual prefixing:** Each child chunk is prepended with its document title (`[{title}] {window}`) before embedding, anchoring the global subject inside every local vector.
+- **Child-to-parent rollup at query time:** Hybrid search scores and ranks sharp child chunks (`LIMIT 30` per leg), then groups by `parent_id` (`MAX(rrf_score)`) so downstream consumers receive 3 unique, complete parent documents without duplicate context.
+
+### Step B: Incremental Ingestion via SHA-256 Content Hashing
+
+To avoid re-embedding unchanged documents across pipeline runs:
+
+1. Each chunk receives a deterministic SHA-256 fingerprint (`hashlib.sha256(child_text.encode()).hexdigest()`).
+2. Before invoking vLLM, the ingestion script loads existing `(chunk_id, content_hash)` pairs from Postgres into an in-memory lookup dictionary ($O(1)$ lookup).
+3. Only brand-new or modified chunks (`old_hash != new_hash`) are sent to **vLLM** (`runner="pooling"`) with the `"passage: "` prefix in GPU batches of 256, L2-normalized, and upserted atomically via `ON CONFLICT (chunk_id) DO UPDATE`.
+
+### Step C: Post-Load Indexing (HNSW + GIN)
+
+Rather than creating indexes on an empty table, which forces Postgres to rebalance graph edges on every batch insert, both indexes are built after the initial bulk load completes:
+
+- **HNSW vector index (`USING hnsw (embedding vector_ip_ops)`):** Constructs a multi-layer proximity graph for $O(\log N)$ approximate nearest-neighbor search. Because vLLM embeddings are L2-normalized to unit length, inner product (`<#>`) yields identical rankings to cosine similarity without redundant norm divisions.
+- **GIN lexical index (`USING gin (fts)`):** Builds an inverted token dictionary over `tsvector`, allowing the `WHERE fts @@ websearch_to_tsquery('simple', query)` filter to exclude zero-match documents and eliminate lexical rank dilution during Reciprocal Rank Fusion (RRF).
