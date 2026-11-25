@@ -1,0 +1,121 @@
+---
+layout: ../../layouts/ExperimentLayout.astro
+title: "Grounded RAG Architecture: From SQL Ranking to Verified Generation"
+summary: "Connecting PostgreSQL Weighted RRF retrieval to constrained Qwen2.5-3B-Instruct generation with inline citations, deterministic abstention, trace logging, and two-mode faithfulness auditing."
+date: "2026-11-25"
+order: 3
+tags: ["RAG", "Qwen2.5-3B", "vLLM", "PostgreSQL", "Weighted RRF", "LLM-as-a-Judge", "Citation Verification"]
+highlights:
+  - label: "Generator"
+    value: "Qwen2.5-3B-Instruct (T=0.0)"
+  - label: "Context Budget"
+    value: "Top-3 Unique Parents"
+  - label: "Trace Store"
+    value: "data/rag_traces.jsonl"
+  - label: "Evaluation"
+    value: "Regex Validator + CoT Judge"
+---
+
+## 1. Motivation for Retrieval-Augmented Generation (RAG)
+
+Hybrid search (`HNSW` + `GIN`) solves document discovery, returning the top-$K$ relevant parent documents for a query. However, raw retrieval alone leaves two gaps in production workflows:
+
+1. **Synthesis Overhead:** Returning three full multi-paragraph scientific abstracts forces the user to manually read, cross-reference, and extract the specific claim answering their question.
+2. **Parametric Hallucination vs. Domain Grounding:** Standalone LLMs rely on static pre-training weights, causing them to hallucinate when queried on specialized, proprietary, or newly ingested corpora.
+
+By feeding PostgreSQL's top-ranked parent documents into a constrained generator (`Qwen/Qwen2.5-3B-Instruct`), RAG turns raw search hits into concise, verifiable answers anchored strictly to retrieved evidence with inline source citations.
+
+---
+
+## 2. Utilizing SQL Ranking for RAG Context Construction
+
+How retrieved documents are deduplicated and ordered before entering the prompt directly impacts generation accuracy:
+
+1. **Child-to-Parent Rollup (`GROUP BY parent_id`):** Retrieval runs at the fine-grained child-chunk level (120-word windows) so embeddings remain sharp, over-fetching `LIMIT 30` per leg. PostgreSQL then groups hits by `parent_id` using `MAX(rrf_score)` so the LLM receives 3 unique, complete parent documents rather than duplicate overlapping snippets from the same paper.
+2. **Mitigating Position Bias via RRF Ordering:** LLMs exhibit position bias—attending most strongly to text at the very beginning and very end of a prompt while under-attending to middle context. Sorting parent documents descending by **Weighted RRF** score (`0.7` semantic + `0.3` lexical) places the highest-confidence source at **Position #1**, maximizing the chance that the generator extracts the primary answer accurately.
+
+```sql
+SELECT
+    parent_id,
+    parent_text,
+    MAX(rrf_score) AS best_score
+FROM fused
+GROUP BY parent_id, parent_text
+ORDER BY best_score DESC
+LIMIT 3;
+```
+
+---
+
+## 3. Prompt Structure for Grounded Generation
+
+To prevent the generator from extrapolating beyond the retrieved documents, the prompt enforces three explicit constraints alongside deterministic decoding (`temperature=0.0`, `repetition_penalty=1.15`):
+
+```text
+Answer the question using ONLY the Context below.
+Rules:
+1. Cite the source ID in brackets after every claim, e.g., [31715818].
+2. Do NOT use outside knowledge or extrapolate beyond the text.
+3. If the Context does not contain enough information, reply exactly: "I cannot answer this based on the provided documents."
+
+Context:
+[{parent_id_1}]
+{parent_text_1}
+
+---
+
+[{parent_id_2}]
+{parent_text_2}
+
+---
+
+[{parent_id_3}]
+{parent_text_3}
+
+Question: {query}
+Answer:
+```
+
+- **Bracketed Source Identifiers (`[{parent_id}]`):** Wraps every context block in its primary key so the model can emit machine-parseable citations (`[21366394]`).
+- **Closed-World Constraint (Rule 2):** Explicitly blocks parametric memory fallback.
+- **Exact Abstention Phrase (Rule 3):** Gives the model a deterministic escape hatch when retrieval misses or a query is out-of-domain, allowing automated regex checks to distinguish clean refusals from silent hallucinations.
+
+---
+
+## 4. Trace Analysis: Real Execution Examples
+
+All generation runs are logged to a crash-safe `data/rag_traces.jsonl` file so inference is decoupled from offline evaluation. Inspecting two real traces illustrates both the strength of SQL-ranked grounding and why automated post-checks remain essential.
+
+### Case A: Grounded Synthesis (`query_id: "217"`)
+- **Query:** *"CX3CR1 on the Th2 cells promotes T cell survival"*
+- **SQL Retrieved IDs (Ranked #1 $\rightarrow$ #3):** `["21366394", "22174015", "5386514"]`
+- **Rank #1 Context (`[21366394]`):** *"CX3CR1 is required for airway inflammation by promoting T helper cell survival and maintenance in inflamed lung... We found that CX3CR1 signaling promoted T(H)2 survival in the inflamed lungs..."*
+- **Generated Answer:**
+  > `[21366394]` states that CX3CR1 signaling promoted T(H)2 survival in the inflamed lungs. This directly supports the statement about CX3CR1 on Th2 cells promoting T cell survival. `[21366394]`
+  >
+  > Additional context if needed: Based on the given context, I can provide additional relevant details. For instance, it mentions that CX3CR1 deficiency leads to reduced lung disease upon allergen challenge, indicating its protective effect... In summary, while direct citations support the core claim, further elaboration might require inference from related findings within the same document. `[21366394]`
+
+**Engineering Takeaway:**
+- Weighted RRF placed the exact target paper (`21366394`) at **Rank #1** ahead of distractors on Th17 cells (`22174015`) and NLRP3 inflammasomes (`5386514`), enabling the generator to confirm and cite the exact claim in its opening sentence.
+- Compact 3B models tend to append unrequested elaboration (*"Additional context if needed..."*), highlighting why production prompts benefit from explicit length constraints and why verbosity bias must be controlled during evaluation.
+
+---
+
+### Case B: Adversarial Abstention & Prompt-Leakage Diagnostic (`query_id: "trap_01"`)
+- **Query:** *"What is the default TCP port for Kubernetes kubelet?"* (Out-of-domain trap query)
+- **SQL Retrieved IDs:** `["4462419", "17388232", "1346695"]` (Unrelated stem-cell and keratinocyte papers)
+- **Generated Answer:**
+  > I cannot answer this based on the provided documents. `[31715818]`
+
+**Engineering Takeaway:**
+- **Abstention Gate Worked:** Faced with irrelevant biology context, the model refused to guess `10250` from pre-training memory and triggered the exact refusal phrase.
+- **Prompt-Example Leakage Caught by Deterministic Audit:** Even while abstaining, the 3B model appended `[31715818]`—copying the example ID from Rule 1 (`e.g., [31715818]`). Because `31715818` is not in `retrieved_ids` (`["4462419", "17388232", "1346695"]`), our deterministic citation validator (`all(cid in retrieved_ids for cid in cited)`) flags this trace immediately—proving why pairing regex validation with an LLM-as-a-Judge catches subtle small-model artifacts that look harmless at a glance.
+
+---
+
+## 5. Two-Mode Evaluation Pipeline
+
+To audit every trace in `data/rag_traces.jsonl` without manual review, outputs pass through two complementary checks:
+
+1. **Deterministic Structural Validator (`$0` cost):** Verifies via regex (`r"\[([^\]]+)\]"`) that non-abstaining answers include citations and that every cited ID exists in `retrieved_ids`.
+2. **Chain-of-Thought (CoT) Faithfulness Judge:** Uses step-by-step claim extraction to verify whether every statement in the generated answer is 100% entailed by the retrieved parent documents before emitting a structured JSON pass/fail verdict.
