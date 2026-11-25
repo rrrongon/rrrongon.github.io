@@ -1,0 +1,89 @@
+---
+layout: ../../layouts/ExperimentLayout.astro
+title: "Enterprise Applications of Retrieval-Augmented Generation (RAG)"
+summary: "Production architectural patterns for multi-tenant RBAC pre-filtering, fast-changing incremental sync, two-stage cross-encoder domain assistants, and bounded agentic tool loops on PostgreSQL + pgvector and vLLM."
+date: "2026-11-25"
+order: 4
+tags: ["Enterprise RAG", "RBAC", "PostgreSQL", "pgvector", "Cross-Encoder", "Agentic RAG", "vLLM"]
+highlights:
+  - label: "Access Control"
+    value: "SQL Pre-Filtering + Iterative HNSW"
+  - label: "Freshness Sync"
+    value: "SHA-256 Diff + Orphan Pruning"
+  - label: "Precision Stack"
+    value: "Hybrid RRF + Cross-Encoder"
+  - label: "Agent Control"
+    value: "Bounded Tool Loop (Max 2 Hops)"
+---
+
+Moving beyond single-corpus question answering turns RAG into a modular architecture for multi-tenant, real-time, and workflow-driven systems. Below are four core production applications, the failure modes they solve, how each maps to a **PostgreSQL + `pgvector` and vLLM** stack, and a concrete end-to-end example for each.
+
+---
+
+## 1. Personalized Answers & Role-Based Access Control (RBAC)
+
+- **The Problem Without It:**
+  A standard retriever searches the entire knowledge base uniformly, treating an intern, a customer, and an administrator identically. Applying access checks *after* retrieval (post-filtering in Python) breaks silently: if the top-3 global matches belong to restricted documents and get dropped, the generator receives zero context even when valid authorized documents sat at ranks #4 through #6. Conversely, skipping strict isolation leaks sensitive records into the LLM's context window.
+- **High-Level Approach:**
+  Bind retrieval to the caller's identity and permissions (`user_id`, `tenant_id`, or `roles`) by enforcing metadata **pre-filtering** inside the database index query before any text is ranked or passed to the generator.
+- **Implementation-Level Solution:**
+  - Add an `allowed_roles TEXT[]` column (plus a `GIN` index for fast array overlap checks) to the `scifact_chunks` table.
+  - Inject `WHERE allowed_roles && %(user_roles)s` directly inside both the `semantic` and `lexical` CTEs of the hybrid RRF query so unauthorized chunks never enter the candidate pool.
+  - Enable `SET LOCAL hnsw.iterative_scan = strict_order;` (`pgvector` 0.8+) within the transaction so HNSW automatically expands its graph traversal whenever a restricted role matches a small subset of the corpus.
+- **Concrete Example:**
+  Suppose an internal knowledge base stores two incident documents: `doc_04` (*"ERR_4091: Flush stale Redis keys and restart worker"*, `allowed_roles = ['engineer', 'admin']`) and `doc_sec_01` (*"ERR_4091 Production Redis Root Password & Failover Key"*, `allowed_roles = ['admin']`).
+  - **Engineer (`user_roles = ['engineer']`) asks `"How do I remediate ERR_4091?"`:** SQL pre-filtering excludes `doc_sec_01` inside the HNSW/GIN scan, retrieves `doc_04`, and Qwen answers: *"Flush stale Redis keys and restart the worker `[doc_04]`."*
+  - **Intern (`user_roles = ['intern']`) asks the same question:** Neither document matches `allowed_roles`, Postgres returns `[]`, and the abstention gate outputs: *"I cannot answer this based on the provided documents."*
+
+---
+
+## 2. Answers from Fast-Changing Data
+
+- **The Problem Without It:**
+  An LLM's parametric knowledge is frozen at pre-training time, making it blind to live pricing, active incident runbooks, or updated compliance policies. Fine-tuning on rapidly changing data is too slow and expensive, while blindly re-embedding an entire corpus on every minor document edit wastes GPU throughput and risks leaving stale chunks active in search results.
+- **High-Level Approach:**
+  Keep knowledge external in an incrementally synchronized database so updates propagate in seconds without touching model weights, while ensuring superseded versions are overwritten or purged.
+- **Implementation-Level Solution:**
+  - Compute a deterministic **SHA-256 `content_hash`** on each contextualized child chunk and compare it against PostgreSQL's `(chunk_id, content_hash)` lookup map before invoking vLLM—embedding only new or modified chunks (`ON CONFLICT (chunk_id) DO UPDATE`).
+  - Run a cleanup pass (`DELETE FROM scifact_chunks WHERE parent_id = %s AND chunk_id != ALL(%s)`) whenever a document shrinks so orphaned trailing chunks from older versions cannot surface during search.
+  - Incorporate an `updated_at` timestamp column into the SQL RRF formula to apply a recency boost when newer documents supersede older ones.
+- **Concrete Example:**
+  At 2:00 PM, your on-call team updates the `ERR_4092` runbook (`doc_05`) from *"Increase `max_connections`"* to *"Switch PgBouncer pool mode to transaction and reload"*, shortening the document from 3 child chunks (`c_0, c_1, c_2`) to 2 (`c_0, c_1`).
+  - The ingestion job detects a new SHA-256 hash only for `doc_05::c_0` and `doc_05::c_1` (skipping the other 5,182 unchanged documents), re-embeds those 2 chunks via vLLM in `< 50 ms`, upserts them, and deletes orphaned `doc_05::c_2`.
+  - At 2:01 PM, an engineer queries `"fix ERR_4092"` and immediately receives the updated PgBouncer remediation without any model retraining.
+
+---
+
+## 3. High-Precision Domain Assistants
+
+- **The Problem Without It:**
+  General-purpose LLMs hallucinate plausible-sounding specifications, medical mechanisms, or configuration flags when queried on specialized corpora. Even with basic dense retrieval, a single-stage bi-encoder (`e5-small`) compresses query and document tokens into separate vectors—occasionally ranking keyword-overlapping distractors above the exact passage that resolves a subtle domain condition or negation.
+- **High-Level Approach:**
+  Pair a domain-specific knowledge base with **Parent-Child context preservation**, **Two-Stage Retrieval** (bi-encoder recall followed by cross-encoder precision reranking), and strict closed-world citation prompts.
+- **Implementation-Level Solution:**
+  - Index overlapping `120-word` child chunks prefixed with `[Title]` for sharp vector and `tsvector('simple')` lexical matching, then roll up via `GROUP BY parent_id` (`MAX(rrf_score)`) so the generator reads full, uninterrupted parent sections.
+  - Over-fetch the top-20 unique parents from PostgreSQL and pass `(query, parent_text)` pairs through a **Cross-Encoder reranker** (`BAAI/bge-reranker-base`) to score full token-level cross-attention before selecting the top-3 for generation.
+  - Constrain `Qwen/Qwen2.5-3B-Instruct` (`temperature=0.0`, `repetition_penalty=1.15`) to emit inline `[parent_id]` citations after every claim and output an exact refusal string when evidence is missing.
+- **Concrete Example:**
+  In your `SciFact` biomedical assistant, a researcher asks: *"Does CX3CR1 promote Th2 cell survival in inflamed lungs?"* (`query_id: "217"`).
+  - Stage 1 (Postgres Hybrid RRF) retrieves 20 candidates including distractor papers on Th17 cells (`22174015`) and NLRP3 inflammasomes (`5386514`).
+  - Stage 2 (Cross-Encoder Reranker) scores joint attention between the query and `[21366394]`, locking `[21366394]` at Rank #1.
+  - Qwen synthesizes the exact answer with auditability: *"CX3CR1 signaling promotes Th2 cell survival and maintenance in inflamed lungs `[21366394]`."*
+
+---
+
+## 4. Agents & Tool-Using Workflows
+
+- **The Problem Without It:**
+  Standard RAG is a rigid, single-pass pipeline (`1 query -> 1 search -> 1 answer`). If a user asks a compound multi-hop question or uses ambiguous phrasing that misses on the first search, a single retrieval call returns incomplete context and cannot self-correct or trigger downstream remediation steps.
+- **High-Level Approach:**
+  Expose retrieval as a callable tool inside a bounded LLM reasoning loop, allowing the model to decompose complex questions, inspect initial search results, rewrite queries when evidence is missing, and chain retrieval with operational tools.
+- **Implementation-Level Solution:**
+  - Wrap `retrieve_unique_parents()` as a structured function tool (`search_docs(query: str)`) alongside domain action tools (e.g., `draft_incident_ticket()`).
+  - Enforce a hard execution budget (`max_search_steps = 2`) in the orchestration loop so the model can issue follow-up sub-queries on multi-hop questions without entering infinite retry loops.
+  - Log the full execution trajectory (`tool_calls`, `arguments`, `retrieved_ids`, and `final_answer`) to `rag_traces.jsonl` so evaluation checks both **tool-selection accuracy** and **grounded faithfulness**.
+- **Concrete Example:**
+  A user asks a two-part question: *"Compare how CX3CR1 regulates Th2 survival versus how S6K2 regulates Th17 differentiation."*
+  - **Step 1 (Decomposition & Hop 1):** Instead of running one blurred search, the agent calls `search_docs("CX3CR1 Th2 cell survival")`, retrieving `[21366394]`.
+  - **Step 2 (Hop 2):** Within its 2-step search budget, the agent calls `search_docs("S6K2 Th17 differentiation")`, retrieving `[22174015]`.
+  - **Step 3 (Grounded Synthesis):** Combining both retrieved parent documents, the agent outputs a comparative answer citing `[21366394]` for lung Th2 survival and `[22174015]` for nuclear ROR$\gamma$ translocation in Th17 cells.
