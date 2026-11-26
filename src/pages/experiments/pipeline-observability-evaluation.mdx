@@ -1,0 +1,199 @@
+---
+layout: ../../layouts/ExperimentLayout.astro
+title: "Pipeline Observability & Evaluation: Stage-by-Stage Analysis"
+summary: "Instrumenting offline ingestion, PostgreSQL HNSW+GIN hybrid retrieval, and Qwen2.5-3B-Instruct grounded generation into isolated telemetry spans to pinpoint latency bottlenecks and structural failure modes."
+date: "2026-11-26"
+order: 5
+tags: ["Observability", "Telemetry", "vLLM", "PostgreSQL", "pgvector", "Qwen2.5-3B", "RAG Evaluation"]
+highlights:
+  - label: "Offline Ingestion"
+    value: "59.64s (12,084 Chunks)"
+  - label: "DB Hybrid Latency"
+    value: "4.70 ms Avg / 6.43 ms P95"
+  - label: "Retrieval Quality"
+    value: "Recall@3 = 0.72 | MRR@3 = 0.69"
+  - label: "Structural Audit"
+    value: "80% Pass (41 / 51 Traces)"
+---
+
+To prevent silent failures—where an LLM produces fluent answers over bad context or hits hidden latency bottlenecks—the pipeline is instrumented into three distinct telemetry stages. Separating **offline ingestion**, **online hybrid retrieval**, and **grounded generation** isolates performance bottlenecks and traces answer quality back to its root cause.
+
+---
+
+## Stage 1: Offline Ingestion & Index Construction
+
+<svg viewBox="0 0 760 225" width="100%" role="img" aria-label="Stage 1 Offline Ingestion Time Breakdown">
+  <rect x="0" y="0" width="760" height="225" rx="8" fill="#f8fafc" stroke="#e2e8f0" />
+  <text x="380" y="26" text-anchor="middle" font-size="14" font-weight="700" fill="#0f172a">Stage 1: Offline Ingestion Pipeline Breakdown (12,084 Chunks / 5,183 Docs)</text>
+
+  {/* Stacked Bar: Total Active Ingestion = 59.64s (x=50 to x=710, width=660) */}
+  {/* Batch Embedding: 23.92s (40.1% -> 265px) */}
+  <rect x="50" y="52" width="265" height="36" rx="4" fill="#2563eb" />
+  <text x="182" y="74" text-anchor="middle" font-size="11" font-weight="700" fill="#ffffff">GPU Embed: 23.92s (40%)</text>
+
+  {/* Postgres Bulk Insert: 26.27s (44.1% -> 291px) */}
+  <rect x="317" y="52" width="291" height="36" rx="4" fill="#0d9488" />
+  <text x="462" y="74" text-anchor="middle" font-size="11" font-weight="700" fill="#ffffff">Postgres Insert: 26.27s (44%)</text>
+
+  {/* Post-Load Index Build: 9.45s (15.8% -> 102px) */}
+  <rect x="610" y="52" width="100" height="36" rx="4" fill="#7c3aed" />
+  <text x="660" y="74" text-anchor="middle" font-size="11" font-weight="700" fill="#ffffff">Index: 9.45s</text>
+
+  <text x="380" y="106" text-anchor="middle" font-size="11" font-weight="600" fill="#334155">Active Ingestion Total: 59.64s (505 chunks/s GPU prefill | ~460 rows/s DB write)</text>
+
+  {/* Cold Start Reference Bar */}
+  <line x1="50" y1="126" x2="710" y2="126" stroke="#e2e8f0" stroke-width="1" />
+  <text x="50" y="150" font-size="11" font-weight="600" fill="#475569">One-Time Cold Start (vLLM Model Load):</text>
+  <rect x="285" y="137" width="96" height="20" rx="3" fill="#64748b" />
+  <text x="390" y="151" font-size="11" font-weight="600" fill="#334155">8.66s (amortized across runs)</text>
+
+  {/* Incremental SHA-256 Run Reference */}
+  <text x="50" y="184" font-size="11" font-weight="600" fill="#475569">Incremental Run (Unchanged Corpus):</text>
+  <rect x="285" y="171" width="12" height="20" rx="3" fill="#059669" />
+  <text x="306" y="185" font-size="11" font-weight="600" fill="#059669">~0.0s GPU/Index work (SHA-256 hash skip)</text>
+</svg>
+
+### Telemetry Results
+
+| Metric | Measured Value | Engineering Interpretation |
+| :--- | :--- | :--- |
+| **Model Load (`intfloat/e5-small`)** | `8.66s` | One-time cold-start overhead to initialize the vLLM pooling engine on GPU. |
+| **Batch Embedding (12,084 chunks)** | `23.92s` (`505 chunks/s`, `1.98 ms/chunk`) | High GPU prefill throughput achieved by batching (`bs=256`) rather than encoding chunks sequentially. |
+| **PostgreSQL Bulk Insert** | `26.27s` (`~460 rows/s`) | Writes text, parent context, SHA-256 hashes, and 384-d vectors while auto-generating `tsvector('simple')` columns. |
+| **Post-Load Index Build (`HNSW` + `GIN`)** | `9.45s` (`59.64s - 23.92s - 26.27s`) | Building both indexes once after bulk insertion avoids incremental graph rebalancing and completes in under 10 seconds. |
+
+### What These Numbers Tell Us
+- **Balanced Compute & I/O Under 60 Seconds:** End-to-end ingestion of 5,183 parent documents (12,084 child chunks) completes in **59.64s**, with compute split almost evenly between GPU embedding (**40%**) and database I/O (**44%**), while post-load indexing accounts for just **16%**.
+- **Zero-Redundancy Incremental Updates:** Because every row stores a deterministic SHA-256 `content_hash`, subsequent incremental runs skip unchanged chunks and incur near-zero embedding or index rebuild overhead.
+
+---
+
+## Stage 2: Query Embedding & Hybrid Retrieval (50-Query Benchmark)
+
+<svg viewBox="0 0 760 250" width="100%" role="img" aria-label="Stage 2 Retrieval Rank Distribution and End-to-End Per-Query Latency">
+  <rect x="0" y="0" width="760" height="250" rx="8" fill="#f8fafc" stroke="#e2e8f0" />
+
+  {/* Left Panel: Rank Distribution (50 Queries) */}
+  <text x="195" y="26" text-anchor="middle" font-size="13" font-weight="700" fill="#0f172a">Target Document Rank (50 Queries)</text>
+
+  <text x="105" y="64" text-anchor="end" font-size="11" font-weight="600" fill="#0f172a">Rank #1 (RR 1.0)</text>
+  <rect x="115" y="50" width="198" height="20" rx="3" fill="#059669" />
+  <text x="320" y="64" font-size="11" font-weight="700" fill="#059669">33 (66%)</text>
+
+  <text x="105" y="96" text-anchor="end" font-size="11" font-weight="600" fill="#0f172a">Rank #2 (RR 0.5)</text>
+  <rect x="115" y="82" width="12" height="20" rx="3" fill="#3b82f6" />
+  <text x="134" y="96" font-size="11" font-weight="600" fill="#334155">2 (4%)</text>
+
+  <text x="105" y="128" text-anchor="end" font-size="11" font-weight="600" fill="#0f172a">Rank #3 (RR 0.33)</text>
+  <rect x="115" y="114" width="6" height="20" rx="3" fill="#60a5fa" />
+  <text x="128" y="128" font-size="11" font-weight="600" fill="#334155">1 (2%)</text>
+
+  <text x="105" y="160" text-anchor="end" font-size="11" font-weight="600" fill="#0f172a">Missed Top-3</text>
+  <rect x="115" y="146" width="84" height="20" rx="3" fill="#94a3b8" />
+  <text x="206" y="160" font-size="11" font-weight="600" fill="#475569">14 (28%)</text>
+
+  <text x="195" y="198" text-anchor="middle" font-size="11" font-weight="700" fill="#0f172a">Recall@3 = 0.72 (36/50) | MRR@3 = 0.69</text>
+  <text x="195" y="216" text-anchor="middle" font-size="10" fill="#475569">91.7% of hits (33/36) land directly at Rank #1</text>
+
+  {/* Divider */}
+  <line x1="395" y1="18" x2="395" y2="232" stroke="#cbd5e1" stroke-width="1" />
+
+  {/* Right Panel: Per-Query Latency Breakdown (ms) */}
+  <text x="578" y="26" text-anchor="middle" font-size="13" font-weight="700" fill="#0f172a">Per-Query Latency Share (219.5 ms Total)</text>
+
+  <text x="505" y="70" text-anchor="end" font-size="11" font-weight="600" fill="#0f172a">DB Hybrid RRF</text>
+  <rect x="515" y="56" width="8" height="22" rx="3" fill="#0d9488" />
+  <text x="530" y="71" font-size="11" font-weight="700" fill="#0d9488">4.70 ms (2.1%)</text>
+
+  <text x="505" y="112" text-anchor="end" font-size="11" font-weight="600" fill="#0f172a">Query Embed</text>
+  <rect x="515" y="98" width="38" height="22" rx="3" fill="#2563eb" />
+  <text x="560" y="113" font-size="11" font-weight="600" fill="#334155">34.40 ms (15.7%)</text>
+
+  <text x="505" y="154" text-anchor="end" font-size="11" font-weight="600" fill="#0f172a">LLM Generation</text>
+  <rect x="515" y="140" width="185" height="22" rx="3" fill="#d97706" />
+  <text x="522" y="155" font-size="11" font-weight="700" fill="#ffffff">180.40 ms (82.2%)</text>
+
+  <text x="578" y="198" text-anchor="middle" font-size="11" font-weight="600" fill="#334155">DB P95 Tail Latency: 6.43 ms</text>
+  <text x="578" y="216" text-anchor="middle" font-size="10" fill="#475569">Ample latency headroom for Top-20 reranking</text>
+</svg>
+
+### Telemetry & Retrieval Metrics
+
+| Span / Metric | Measured Value | What It Means |
+| :--- | :--- | :--- |
+| **`[EMBED SPAN]` Batch Encoding** | `1,720.2 ms` total (`34.40 ms/query`) | Encodes all 50 queries with `"query: "` prefixes and L2 normalization in a single vLLM forward pass. |
+| **`[DB SPAN]` Hybrid RRF Latency** | Avg: `4.70 ms` \| P95: `6.43 ms` | Sub-7 ms tail latency across 12,084 indexed rows, confirming PostgreSQL used the `HNSW` and `GIN` indexes rather than sequential scans. |
+| **`Recall@3` (Retrieval Coverage)** | `0.72` (`36 / 50` queries) | In 72% of queries, the ground-truth parent document appeared inside the top-3 deduplicated results. |
+| **`MRR@3` (Ranking Sharpness)** | `0.69` | Measures rank-weighted precision ($\frac{1}{\text{rank}}$), rewarding `#1` placement over `#2` or `#3`. |
+
+### Diagnostic Breakdown of the Retrieval Scores
+- **High Rank Concentration (`0.72` Recall vs. `0.69` MRR):** Out of the 36 queries where PostgreSQL found the target document, **33 landed at Rank #1** (`RR = 1.0`), **2 at Rank #2** (`RR = 0.50`), and **1 at Rank #3** (`RR = 0.33`). That minimal `0.03` gap between `Recall@3` and `MRR@3` shows that when the hybrid RRF retriever finds the right paper, it almost always places it at **Position #1**—where LLM attention is strongest.
+- **Sub-5 ms Database Overhead:** At `4.70 ms` average (`6.43 ms` P95), database retrieval adds negligible latency compared to downstream LLM generation (`180.4 ms/query`).
+
+---
+
+## Stage 3: Grounded Generation & Deterministic Evaluation (51-Query Run)
+
+<svg viewBox="0 0 760 220" width="100%" role="img" aria-label="Stage 3 Grounded Generation and Deterministic Audit Breakdown across 51 Queries">
+  <rect x="0" y="0" width="760" height="220" rx="8" fill="#f8fafc" stroke="#e2e8f0" />
+  <text x="380" y="26" text-anchor="middle" font-size="14" font-weight="700" fill="#0f172a">Stage 3: Generation Behavior & Structural Audit (51 Queries = 50 SciFact + 1 Trap)</text>
+
+  {/* Row 1: Retrieval Context Coverage */}
+  <text x="175" y="64" text-anchor="end" font-size="11" font-weight="600" fill="#0f172a">Context Coverage</text>
+  <rect x="185" y="49" width="353" height="22" rx="3" fill="#2563eb" />
+  <text x="361" y="64" text-anchor="middle" font-size="11" font-weight="700" fill="#ffffff">Target Retrieved: 36 (70.6%)</text>
+  <rect x="540" y="49" width="147" height="22" rx="3" fill="#94a3b8" />
+  <text x="613" y="64" text-anchor="middle" font-size="11" font-weight="600" fill="#ffffff">Miss/Trap: 15</text>
+
+  {/* Row 2: Model Abstention Rate */}
+  <text x="175" y="102" text-anchor="end" font-size="11" font-weight="600" fill="#0f172a">Model Response</text>
+  <rect x="185" y="87" width="441" height="22" rx="3" fill="#d97706" />
+  <text x="405" y="102" text-anchor="middle" font-size="11" font-weight="700" fill="#ffffff">Abstained: 45 (88.2%)</text>
+  <rect x="628" y="87" width="59" height="22" rx="3" fill="#059669" />
+  <text x="657" y="102" text-anchor="middle" font-size="11" font-weight="700" fill="#ffffff">Ans: 6</text>
+
+  {/* Row 3: Token Stop Reason */}
+  <text x="175" y="140" text-anchor="end" font-size="11" font-weight="600" fill="#0f172a">Stop Reason</text>
+  <rect x="185" y="125" width="255" height="22" rx="3" fill="#0d9488" />
+  <text x="312" y="140" text-anchor="middle" font-size="11" font-weight="700" fill="#ffffff">Clean EOS Stop: 26 (51%)</text>
+  <rect x="442" y="125" width="245" height="22" rx="3" fill="#e11d48" />
+  <text x="564" y="140" text-anchor="middle" font-size="11" font-weight="700" fill="#ffffff">Truncated (max_tokens=256): 25 (49%)</text>
+
+  {/* Row 4: Structural Audit Pass Rate */}
+  <text x="175" y="178" text-anchor="end" font-size="11" font-weight="600" fill="#0f172a">Structural Audit</text>
+  <rect x="185" y="163" width="402" height="22" rx="3" fill="#059669" />
+  <text x="386" y="178" text-anchor="middle" font-size="11" font-weight="700" fill="#ffffff">Passed All Regex Rules: 41 (80.4%)</text>
+  <rect x="589" y="163" width="98" height="22" rx="3" fill="#dc2626" />
+  <text x="638" y="178" text-anchor="middle" font-size="11" font-weight="700" fill="#ffffff">Fail: 10</text>
+</svg>
+
+### Telemetry & Structural Audit Results
+
+| Span / Metric | Measured Value | What It Means |
+| :--- | :--- | :--- |
+| **`[MODEL LOAD]` (`Qwen2.5-3B-Instruct`)** | `26.46s` | Cold-start time to load weights and allocate KV-cache (`max_model_len=4096`) after freeing the embedding model. |
+| **`[GEN SPAN]` Batch Inference (51 queries)** | `9.20s` (`180.4 ms/query`) \| `1,047.9 tok/s` | Continuous batching in vLLM sustains over 1,000 output tokens/sec across 50 SciFact queries + 1 trap query (`trap_01`). |
+| **`[TOKENS]` Prompt / Output Length** | Avg Prompt: `1,281` \| Avg Output: `189` | Three full parent abstracts average ~1,281 input tokens per query, well inside the 4,096-token context window. |
+| **Truncated Outputs (`finish_reason='length'`)** | `25 / 51` (`49%`) | Nearly half of the generations hit the `max_tokens=256` ceiling before emitting an EOS stop token. |
+| **`[EVAL MODE 1]` Structural Pass Rate** | `0.80` (`41 / 51` passed) | 80% of responses obeyed all deterministic citation and abstention rules; 10 failed structural validation. |
+| **Abstention Count** | `45 / 51` | Total responses triggering `"I cannot answer this based on the provided documents."` |
+
+### Three Critical Engineering Insights Exposed by Observability
+
+1. **Abstention Count (`45`) vs. Retrieval Hits (`36`):**
+   Only 15 queries genuinely lacked the target document (14 retrieval misses + 1 out-of-domain trap query), yet `Qwen2.5-3B-Instruct` abstained 45 times. In `SciFact`, queries are scientific claims (many of which require multi-sentence inference or are refuted by the abstract rather than stated verbatim). Under strict closed-world prompting (*"Do NOT extrapolate beyond the text"*), a conservative 3B model defaults to abstaining whenever a claim is not explicitly confirmed verbatim—trading lower recall for near-zero hallucination.
+2. **Why 25 Outputs Hit `max_tokens=256` (Avg Output: `189` tokens):**
+   A clean abstention requires only **12 tokens**. Seeing an average of `189` output tokens and `25` length truncations alongside `45` abstentions reveals that the model frequently emitted the refusal phrase first, then ignored the negative constraint and appended lengthy document-by-document summaries (`[doc_id] discusses...`) until hitting `max_tokens=256`.
+3. **Why 10 Traces Failed Deterministic Structural Validation (`0.80` Pass Rate):**
+   Inspecting the 10 failed traces isolates two small-model formatting failure modes caught automatically at `$0` evaluation cost:
+   - **Prompt-Example Leakage:** On abstentions, the model occasionally copied the prompt's placeholder ID (`[31715818]`), which regex validation immediately flagged because `31715818` was absent from `retrieved_ids`.
+   - **Uncited Claims:** On non-abstaining responses, the model occasionally stated a finding from the context without attaching a bracketed `[parent_id]` citation.
+
+---
+
+## Summary: How Observability Guides the Next Iteration
+
+By instrumenting each stage independently rather than looking at a single end-to-end accuracy number, the exact optimization roadmap becomes clear:
+
+1. **Lift `Recall@3` (`0.72` $\rightarrow$ `0.85+`):** Over-fetch the top-20 unique parents from PostgreSQL (`4.70 ms` leaves ample latency headroom) and add a **Cross-Encoder Reranker** before generation.
+2. **Eliminate `finish_reason='length'` Truncations (`25` $\rightarrow$ `0`) & Raise Structural Pass Rate (`0.80` $\rightarrow$ `0.98+`):** Add a stop sequence (`stop=["\n\n"]`) immediately after the abstention sentence and remove concrete numeric IDs from prompt examples so the 3B model cannot leak them into citations.
