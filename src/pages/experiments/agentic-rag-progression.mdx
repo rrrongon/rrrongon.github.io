@@ -1,0 +1,283 @@
+---
+layout: ../../layouts/ExperimentLayout.astro
+title: "Agentic RAG Progression: Stages 1 & 2 Technical Write-Up"
+summary: "Extending the hybrid retrieval and grounded generation stack into a multi-hop, tool-using agent with fast-path pooling, bounded search_docs hops, live PostgreSQL health telemetry, and systematic 3B failure-mode mitigations."
+date: "2026-11-27"
+order: 6
+tags: ["Agentic RAG", "Tool Calling", "Qwen2.5-3B", "vLLM", "PostgreSQL", "Multi-Hop Retrieval", "Observability"]
+highlights:
+  - label: "Fast-Path Latency"
+    value: "~39 ms (Pooling + RRF)"
+  - label: "Co-Resident GPU"
+    value: "0.10 Embed / 0.65 Gen (24 GB)"
+  - label: "Agent Loop"
+    value: "Bounded Multi-Hop + Live Ops"
+  - label: "Context Window"
+    value: "8,192 Tokens + seen_ids Dedup"
+---
+
+This milestone extends the offline hybrid retrieval and grounded generation pipeline (`intfloat/e5-small` + PostgreSQL `pgvector` HNSW/GIN + `Qwen/Qwen2.5-3B-Instruct` via **vLLM**) into a multi-hop, tool-using agent capable of both iterative document retrieval and live operational telemetry.
+
+---
+
+## System Architecture: Fast-Path Pooling + Bounded Tool Fallback
+
+Because `e5-small` query embedding plus PostgreSQL hybrid RRF retrieval averages **~39 ms**, running a retrieval-first fast path is significantly cheaper than paying for an extra **~180 ms** LLM routing pass on every request.
+
+```text
+User Query
+   │
+   ▼
+[Fast-Path Pooling (~39 ms)] ──► Retrieve Top-3 Unique Parents from PostgreSQL
+   │
+   ▼
+[Qwen2.5-3B-Instruct + Tool Schemas]
+   ├──► Single-hop fact covered? ─────────► Direct Cited Answer (0 tool hops, 1 LLM call)
+   ├──► Second topic missing? ────────────► Call search_docs(sub_query) ──► Final Synthesis
+   └──► Live database status requested? ──► Call check_postgres_health(service) ──► Live Report
+```
+
+---
+
+## Stage 1: Multi-Hop Agent (`search_docs`)
+
+Stage 1 converted the static RAG script into a bounded agent loop (`max_hops=1`) with a single callable tool, `search_docs(query)`.
+
+### Key Implementation Decisions
+- **Co-Resident Model Memory Management:** To keep both `intfloat/e5-small` (`runner="pooling"`) and `Qwen/Qwen2.5-3B-Instruct` loaded simultaneously on a single **24 GB** GPU without OOM crashes, GPU memory was explicitly partitioned (`gpu_memory_utilization=0.10` for embeddings, `0.65` for generation), and import side effects in `eval_pg_retrieval.py` were isolated behind `if __name__ == "__main__":`.
+- **Defensive `<tool_call>` Parsing:** Because `Qwen2.5-3B-Instruct` emits Hermes-style `<tool_call>{...}</tool_call>` blocks only when invoking tools (and plain text otherwise), a regex + `json.loads` parser safely extracts tool calls without crashing on direct answers.
+- **Cross-Hop Deduplication & Context Sizing:** Multi-hop turns frequently retrieve overlapping papers. Tracking a `seen_ids` set across hops, capping retrieved abstracts to `1,800` characters, and raising `max_model_len` to `8192` kept multi-turn prompts well within context limits.
+- **Trajectory Observability:** Every run logs a structured trace (`fast_path` retrieved IDs, per-hop tool calls, sub-queries, latency, and `hops_used`) to JSONL for offline debugging.
+
+---
+
+## Stage 2: Custom Live Service Integration (`check_postgres_health`)
+
+Stage 2 expanded the agent beyond static documents (`SciFact`) by connecting it to a real operational service—the live PostgreSQL database itself.
+
+### Key Implementation Decisions
+- **Live Telemetry Wrapper:** Implemented `check_postgres_health(service)` using `psycopg` to query live connection metrics directly from `pg_stat_activity` and `SHOW max_connections`, returning a compact JSON payload (`service`, `status`, `active_conns`, `max_conns`) that static RAG cannot provide.
+- **Schema Constraints (`enum`):** Locked the `service` parameter in the tool schema with `"enum": ["postgres-main", "postgres-replica"]` so the 3B model cannot hallucinate invalid hostnames.
+- **Error-Safe Tool Registry (`dispatch_tool`):** Replaced hardcoded `search_docs` execution with a unified `TOOL_REGISTRY` dispatcher wrapped in `try/except`. Unknown tool names or invalid arguments are returned as `"role": "tool"` observations, allowing the model to recover instead of crashing the loop.
+
+---
+
+## Response Issues Encountered & How They Were Solved
+
+Instrumenting per-hop traces surfaced four distinct failure modes common to compact (3B) agentic models, each resolved systematically:
+
+| Stage | Observed Response Issue | Root Cause | Solution Applied |
+| :---: | :--- | :--- | :--- |
+| **Stage 1** | **Premature Abstention on Multi-Hop Queries:** On a two-part comparison (`CX3CR1` vs. `S6K2`), Qwen returned *"I cannot answer this based on the provided documents."* with `hops_used: 0`. | The strict abstention rule competed with a restrictive `"ONLY if"` tool instruction on Turn 1; the 3B model took the easier plain-text refusal shortcut instead of emitting a `<tool_call>`. | Made the system prompt hop-aware: forbade abstention while tool hops remained, mandated calling `search_docs` for any missing entity, and re-enabled the strict abstention rule only on the final pass (`active_tools = None`). |
+| **Stage 1** | **Context Overflow (`4097 > 4096` tokens):** Turn 2 crashed with `VLLMValidationError` after tool observations were appended. | Fast-path context (~1,300 tokens) + tool schemas + un-deduplicated Hop 1 abstracts exceeded `max_model_len=4096`. | Raised `max_model_len=8192`, added `seen_ids` deduplication in `search_docs`, capped abstract length (`max_chars=1800`), and reduced follow-up hops to `top_k=2`. |
+| **Stage 2** | **Closed-World Abstention Deadlock on Live Ops Queries:** `check_postgres_health("postgres-main")` succeeded (`HEALTHY`, `7/100` connections), yet Qwen still abstained on Turn 2. | Qwen simultaneously called `search_docs("postgres-main")`, retrieved unrelated biomedical papers from `SciFact`, and let the strict document-grounding rule override the valid live tool output. | Split routing instructions explicitly by intent in the system prompt: directed Postgres health queries to trust `check_postgres_health` directly, and scoped `Initial Context` / `search_docs` strictly to scientific questions. |
+| **Stage 2** | **Context Contamination (Hallucinated Citation):** After fixing abstention, Qwen reported `postgres-main` as `HEALTHY` but appended *"aligns with `[doc_id: 39059143]`"*—an unrelated hospital mortality paper. | Fast-path pooling always injected top-3 `SciFact` abstracts into `Initial Context`, and the citation instruction nudged the 3B model to attach a `[doc_id]` even on operational answers. | Explicitly instructed the model not to cite `Initial Context` documents when answering live database health queries, keeping operational telemetry cleanly separated from scientific RAG citations. |
+
+---
+
+## Stage 1 & Stage 2: Execution Traces & Iterative Debugging Log
+
+Inspecting raw JSONL trajectories—not just final text answers—exposed why `Qwen/Qwen2.5-3B-Instruct` failed on multi-hop and live-service queries and verified each fix across iterations.
+
+### Stage 1: Multi-Hop Agent (`search_docs` Only)
+
+#### Example 1: Single-Fact Query (Fast-Path Baseline — 0 Tool Hops)
+Single-entity questions already answered by the **~39 ms** fast-path Postgres search finish in a single LLM pass without burning a tool hop.
+
+```json
+{
+  "query": "Does CX3CR1 promote Th2 cell survival in inflamed lungs?",
+  "hops_used": 0,
+  "trajectory": [
+    {
+      "stage": "fast_path",
+      "query": "Does CX3CR1 promote Th2 cell survival in inflamed lungs?",
+      "retrieved_ids": ["21366394", "22174015", "5386514"]
+    }
+  ],
+  "answer": "Yes. CX3CR1 signaling promotes T(H)2 cell survival and maintenance in inflamed lungs, though not under homeostatic conditions or peripheral inflammation [21366394]."
+}
+```
+
+#### Example 2: Multi-Hop Comparison (Iterative Debugging: Iteration 1 $\rightarrow$ 2 $\rightarrow$ 3)
+- **Query:** *"Compare how CX3CR1 affects Th2 survival versus how S6K2 affects Th17 differentiation."*
+
+**Iteration 1 — Problem: Premature Abstention (`hops_used: 0`)**
+
+```json
+{
+  "query": "Compare how CX3CR1 affects Th2 survival versus how S6K2 affects Th17 differentiation.",
+  "calls": [],
+  "hops_used": 0,
+  "trajectory": [
+    {
+      "stage": "fast_path",
+      "query": "Compare how CX3CR1 affects Th2 survival versus how S6K2 affects Th17 differentiation."
+    }
+  ],
+  "answer": "I cannot answer this based on the provided documents."
+}
+```
+
+- **Root Cause:** The system prompt placed a restrictive tool rule (`"Call search_docs ONLY if..."`) next to a strict abstention rule on Turn 1. When Initial Context lacked the `S6K2` paper, the 3B model took the easier plain-text refusal shortcut instead of emitting a `<tool_call>`.
+- **Fix Applied:** Made the system prompt hop-aware—forbidding abstention while tool hops remain, requiring `search_docs` for any missing entity, and re-enabling the strict abstention rule only on the final pass (`active_tools = None`).
+
+**Iteration 2 — Problem: Context Length Overflow (`4097 > 4096` Tokens)**
+Once the hop-aware prompt unlocked tool calling, Turn 2 crashed during prompt rendering:
+
+```text
+vllm.exceptions.VLLMValidationError: This model's maximum context length is 4096 tokens.
+However, your prompt contains at least 4097 input tokens, which exceeds this limit even
+without any output tokens. (parameter=input_tokens, value=4097)
+```
+
+- **Root Cause:** Three full fast-path abstracts (~1,300 tokens) + tool schemas + un-deduplicated Hop 1 abstracts pushed the conversation past `max_model_len=4096`.
+- **Fix Applied:** Raised `max_model_len=8192`, added a `seen_ids` set to skip duplicate parent documents across hops, capped abstract length at `max_chars=1800`, and reduced follow-up hops to `top_k=2`.
+
+**Iteration 3 — Resolved Multi-Hop Trace (`hops_used: 1`)**
+
+```json
+{
+  "query": "Compare how CX3CR1 affects Th2 survival versus how S6K2 affects Th17 differentiation.",
+  "hops_used": 1,
+  "trajectory": [
+    {
+      "stage": "fast_path",
+      "query": "Compare how CX3CR1 affects Th2 survival versus how S6K2 affects Th17 differentiation.",
+      "retrieved_ids": ["21366394", "18492011", "5386514"]
+    },
+    {
+      "stage": "hop_1",
+      "tool": "search_docs",
+      "sub_query": "S6K2 Th17 differentiation",
+      "retrieved_ids": ["22174015", "19834120"]
+    }
+  ],
+  "answer": "CX3CR1 signaling promotes Th2 cell survival and maintenance in inflamed lungs [21366394], whereas S6K2 binds RORγ and promotes its nuclear translocation to drive Th17 differentiation [22174015]."
+}
+```
+
+#### Example 3: Out-of-Domain Guardrail (Retry + Clean Abstention)
+Verifies that disabling abstention on Turn 1 does not cause hallucinations on unanswerable queries.
+
+```json
+{
+  "query": "What is the default TCP port for Kubernetes kubelet?",
+  "hops_used": 1,
+  "trajectory": [
+    {
+      "stage": "fast_path",
+      "query": "What is the default TCP port for Kubernetes kubelet?",
+      "retrieved_ids": ["4462419", "17388232", "1346695"]
+    },
+    {
+      "stage": "hop_1",
+      "tool": "search_docs",
+      "sub_query": "Kubernetes kubelet default TCP port",
+      "retrieved_ids": ["9102841", "3184720"]
+    }
+  ],
+  "answer": "I cannot answer this based on the provided documents."
+}
+```
+
+- **Result:** Qwen exhausted its 1 search hop looking for Kubernetes docs, found only unrelated biology papers, and triggered the final-pass abstention rule cleanly without leaking `10250` from pre-training memory or citing irrelevant IDs.
+
+---
+
+### Stage 2: Custom Live Service Integration (`check_postgres_health`)
+- **Query:** *"Check live health of postgres-main."*
+
+**Iteration 1 — Problem: Closed-World Abstention Deadlock**
+
+```json
+{
+  "query": "Check live health of postgres-main.",
+  "hops_used": 1,
+  "trajectory": [
+    {
+      "stage": "fast_path",
+      "query": "Check live health of postgres-main.",
+      "retrieved_ids": ["39059143", "3578380", "5185871"]
+    },
+    {
+      "stage": "hop_1",
+      "tool": "check_postgres_health",
+      "arguments": {"service": "postgres-main"},
+      "obs_preview": "{\"service\": \"postgres-main\", \"status\": \"HEALTHY\", \"active_conns\": 7, \"max_conns\": 100}"
+    },
+    {
+      "stage": "hop_1",
+      "tool": "search_docs",
+      "arguments": {"query": "postgres-main"},
+      "obs_preview": "[25543207]\nPharmacokinetic, pharmacodynamic and clinical profile of novel antiplatelet drugs..."
+    }
+  ],
+  "answer": "I cannot answer this based on the provided documents."
+}
+```
+
+- **Root Cause:** Although `check_postgres_health` succeeded (`HEALTHY`, `7/100` active connections), Qwen simultaneously called `search_docs("postgres-main")`, retrieved an unrelated pharmacology paper (`25543207`), and let the strict document-grounding rule override the valid live database output.
+- **Fix Applied:** Split the system prompt explicitly by intent: routed Postgres status/health queries directly to `check_postgres_health` and scoped `Initial Context` / `search_docs` strictly to scientific questions.
+
+**Iteration 2 — Problem: Context Contamination (Hallucinated Citation)**
+
+```json
+{
+  "query": "Check live health of postgres-main.",
+  "hops_used": 1,
+  "trajectory": [
+    {
+      "stage": "fast_path",
+      "query": "Check live health of postgres-main.",
+      "retrieved_ids": ["39059143", "3578380", "5185871"]
+    },
+    {
+      "stage": "hop_1",
+      "tool": "check_postgres_health",
+      "arguments": {"service": "postgres-main"},
+      "obs_preview": "{\"service\": \"postgres-main\", \"status\": \"HEALTHY\", \"active_conns\": 7, \"max_conns\": 100}"
+    }
+  ],
+  "answer": "The PostgreSQL main service is currently HEALTHY according to the `check_postgres_health` service. This information aligns with the details found in [doc_id: 39059143]."
+}
+```
+
+- **Root Cause:** Splitting the prompt stopped the unnecessary `search_docs` call and fixed abstention, but because fast-path pooling still injected three SciFact abstracts into `Initial Context`, Qwen hallucinated a link to `[doc_id: 39059143]` (hospital mortality and tele-ICU patients).
+- **Fix Applied:** Added an explicit negative constraint to the Postgres routing rule (`"Do NOT cite Initial Context documents when answering database health queries"`).
+
+**Iteration 3 — Resolved Live Telemetry Trace**
+
+```json
+{
+  "query": "Check live health of postgres-main.",
+  "hops_used": 1,
+  "trajectory": [
+    {
+      "stage": "fast_path",
+      "query": "Check live health of postgres-main.",
+      "retrieved_ids": ["39059143", "3578380", "5185871"]
+    },
+    {
+      "stage": "hop_1",
+      "tool": "check_postgres_health",
+      "arguments": {"service": "postgres-main"},
+      "obs_preview": "{\"service\": \"postgres-main\", \"status\": \"HEALTHY\", \"active_conns\": 7, \"max_conns\": 100}"
+    }
+  ],
+  "answer": "postgres-main is currently HEALTHY with 7 out of 100 active connections according to check_postgres_health."
+}
+```
+
+---
+
+## Summary: Promoting Observed Failures into Deterministic Regression Gates
+
+Every failure caught during Stages 1 and 2 maps directly to an automated span-level assertion to prevent future prompt or model regressions:
+
+| Test Case | Expected Hops | Required Tool Call | Deterministic Pass Assertion |
+| :--- | :---: | :--- | :--- |
+| **Single-Fact RAG (`CX3CR1`)** | `0` | None (fast-path only) | `hops_used == 0` and `"[21366394]"` in answer |
+| **Multi-Hop Comparison (`CX3CR1` vs `S6K2`)** | `1` | `search_docs` (sub-query contains `"S6K2"`) | `"[21366394]"` and `"[22174015]"` both cited; `input_tokens < 8192` |
+| **Out-of-Domain Trap (`kubelet` port)** | `1` | `search_docs` | Exact abstention string; `0` cited IDs |
+| **Live DB Health (`postgres-main`)** | `1` | `check_postgres_health(service="postgres-main")` | Reports `"HEALTHY"` & active count; `0` SciFact `[doc_id]` citations leaked |
